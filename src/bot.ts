@@ -8,6 +8,7 @@ import { AiResponse, parseAndValidateAiResponse, formatAiResponseForTelegram } f
 import WebSocket from "ws";
 import { ImageProcessor } from "./imageProcessor";
 import { getSystemPrompt } from "./prompts";
+import { logEvent } from "./structuredLogger";
 
 dotenv.config();
 
@@ -346,6 +347,14 @@ class QuantBot {
     async captureLegend(symbolConfig: SymbolConfig): Promise<{ pathEntry: string, pathContext: string }> {
         const { symbol, coinSymbol, exchange, legendUrl } = symbolConfig;
         const { debug, slowMo } = CONFIG.browser;
+        const startedAt = Date.now();
+
+        logEvent({
+            symbol,
+            phase: "capture_legend",
+            status: "start",
+            meta: { coinSymbol, exchange, entryTf: CONFIG.timeframes.entryTf, contextTf: CONFIG.timeframes.contextTf },
+        });
 
         // Закрываем старый браузер если был
         if (this.browser) {
@@ -404,7 +413,16 @@ class QuantBot {
             const pathEntry = `./screenshots/${symbol.toLowerCase()}_${entryTf.toLowerCase()}.png`;
             if (!fs.existsSync("./screenshots")) fs.mkdirSync("./screenshots");
             await this.removeChartPanes(page);
+            const entryScreenshotStartedAt = Date.now();
             await page.screenshot({ path: pathEntry, fullPage: false });
+            logEvent({
+                symbol,
+                phase: "screenshot_entry",
+                status: "success",
+                duration_ms: Date.now() - entryScreenshotStartedAt,
+                screenshot_path: pathEntry,
+                selector_used: `div.b-h:has-text("${entryTf}")`,
+            });
             console.log(chalk.green(`📸 Скриншот ${entryTf} успешно сделан!`));
 
             // ==== ПЕРЕКЛЮЧЕНИЕ НА СТАРШИЙ ТАЙМФРЕЙМ ====
@@ -416,10 +434,38 @@ class QuantBot {
             }
             const pathContext = `./screenshots/${symbol.toLowerCase()}_${contextTf.toLowerCase()}.png`;
             await this.removeChartPanes(page);
+            const contextScreenshotStartedAt = Date.now();
             await page.screenshot({ path: pathContext, fullPage: false });
+            logEvent({
+                symbol,
+                phase: "screenshot_context",
+                status: "success",
+                duration_ms: Date.now() - contextScreenshotStartedAt,
+                screenshot_path: pathContext,
+                selector_used: `div.b-h:has-text("${contextTf}")`,
+            });
             console.log(chalk.green(`📸 Скриншот ${contextTf} успешно сделан!`));
 
+            logEvent({
+                symbol,
+                phase: "capture_legend",
+                status: "success",
+                duration_ms: Date.now() - startedAt,
+                screenshot_path: `${pathEntry},${pathContext}`,
+                meta: { coinSymbol, exchange },
+            });
+
             return { pathEntry, pathContext };
+        } catch (error: any) {
+            logEvent({
+                symbol,
+                phase: "capture_legend",
+                status: "failure",
+                duration_ms: Date.now() - startedAt,
+                error: error?.message || String(error),
+                meta: { coinSymbol, exchange, legendUrl },
+            });
+            throw error;
         } finally {
             await page.close();
             await context.close();
@@ -448,6 +494,15 @@ class QuantBot {
      * Переключает монету через модальное окно поиска
      */
     private async switchCoin(page: Page, coinSymbol: string, exchange: string): Promise<void> {
+        const startedAt = Date.now();
+        const selectorUsed = `div.dialog-list-item has text="${exchange}"`;
+        logEvent({
+            symbol: coinSymbol,
+            phase: "switch_coin",
+            status: "start",
+            selector_used: selectorUsed,
+            meta: { exchange },
+        });
         console.log(chalk.cyan(`🔍 Переключение на ${coinSymbol} (${exchange})...`));
 
         // 1. Нажимаем на иконку поиска
@@ -532,6 +587,14 @@ class QuantBot {
         await page.waitForTimeout(5000);
 
         console.log(chalk.green(`   ✅ Монета ${coinSymbol} (${exchange}) успешно выбрана!`));
+        logEvent({
+            symbol: coinSymbol,
+            phase: "switch_coin",
+            status: "success",
+            duration_ms: Date.now() - startedAt,
+            selector_used: selectorUsed,
+            meta: { exchange },
+        });
     }
 
     private async sleep(ms: number): Promise<void> {
@@ -587,6 +650,7 @@ class QuantBot {
     ): Promise<AiResponse> {
         // Создаём копию contents для модификации при ретраях
         const workingContents = [...contents];
+        const startedAt = Date.now();
 
         for (let attempt = 0; attempt <= retries; attempt++) {
             const result = await ai.models.generateContent({
@@ -597,16 +661,39 @@ class QuantBot {
             const text = result.text?.trim();
             if (!text) {
                 console.log(chalk.yellow(`⚠️ [${symbol}] AI вернул пустой ответ, попытка ${attempt + 1}/${retries + 1}`));
+                logEvent({
+                    symbol,
+                    phase: "ai_response_parse",
+                    status: "retry",
+                    duration_ms: Date.now() - startedAt,
+                    retry_count: attempt,
+                    message: "AI returned empty response",
+                });
                 continue;
             }
 
             try {
                 const parsed = parseAndValidateAiResponse(text);
                 console.log(chalk.green(`✅ [${symbol}] JSON ответ успешно спарсен и валидирован`));
+                logEvent({
+                    symbol,
+                    phase: "ai_response_parse",
+                    status: "success",
+                    duration_ms: Date.now() - startedAt,
+                    retry_count: attempt,
+                });
                 return parsed;
             } catch (e) {
                 const errorMsg = e instanceof Error ? e.message : 'Unknown error';
                 console.log(chalk.yellow(`⚠️ [${symbol}] Ошибка парсинга (попытка ${attempt + 1}/${retries + 1}): ${errorMsg}`));
+                logEvent({
+                    symbol,
+                    phase: "ai_response_parse",
+                    status: attempt < retries ? "retry" : "failure",
+                    duration_ms: Date.now() - startedAt,
+                    retry_count: attempt,
+                    error: errorMsg,
+                });
 
                 if (attempt < retries) {
                     // Добавляем инструкцию для исправления формата
@@ -761,11 +848,26 @@ class QuantBot {
     }
 
     async analyzeAndSend(symbol: string, paths: { pathEntry: string, pathContext: string }) {
+        const startedAt = Date.now();
         console.log(chalk.yellow(`[${symbol}] Отправка в AI для анализа...`));
+        logEvent({
+            symbol,
+            phase: "analyze_and_send",
+            status: "start",
+            screenshot_path: `${paths.pathEntry},${paths.pathContext}`,
+        });
 
         const keyInfo = this.getAvailableKeyForSymbol(symbol);
         if (!keyInfo) {
             console.error(chalk.red(`❌ [${symbol}] Нет доступных ключей. Пропуск цикла.`));
+            logEvent({
+                symbol,
+                phase: "analyze_and_send",
+                status: "failure",
+                duration_ms: Date.now() - startedAt,
+                screenshot_path: `${paths.pathEntry},${paths.pathContext}`,
+                error: "No available Gemini keys",
+            });
             return;
         }
 
@@ -801,10 +903,33 @@ class QuantBot {
         for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
             try {
                 // getValidAiResponse handles JSON validation retries internally
+                const aiStartedAt = Date.now();
                 let aiResponse = await this.getValidAiResponse(ai, requestContents, symbol, 2);
+                logEvent({
+                    symbol,
+                    phase: "ai_generate_content",
+                    status: "success",
+                    duration_ms: Date.now() - aiStartedAt,
+                    ai_key_used: keyInfo.key,
+                    retry_count: attempt,
+                });
 
                 // Применяем жесткий rule-engine поверх ответа модели
                 aiResponse = this.enforceTradeRules(aiResponse);
+                logEvent({
+                    symbol,
+                    phase: "trade_rules",
+                    status: aiResponse.executionPlan.status === "TRADE_NOW" ? "success" : "skip",
+                    ai_key_used: keyInfo.key,
+                    retry_count: attempt,
+                    meta: {
+                        status: aiResponse.executionPlan.status,
+                        waitType: aiResponse.executionPlan.waitType,
+                        side: aiResponse.lowerTimeframe.side,
+                        liquidityInteraction: aiResponse.lowerTimeframe.liquidityInteraction,
+                        tradeTriggerType: aiResponse.lowerTimeframe.tradeTriggerType,
+                    },
+                });
 
                 this.incrementKeyUsage(symbol);
                 this.saveStateFromAiResponse(aiResponse);
@@ -819,10 +944,24 @@ class QuantBot {
 
                 if (this.shouldSkipDuplicateWait(symbol, aiResponse)) {
                     console.log(chalk.gray(`[${symbol}] Duplicate WAIT skipped: ${aiResponse.executionPlan.waitType}`));
+                    logEvent({
+                        symbol,
+                        phase: "telegram_send",
+                        status: "skip",
+                        duration_ms: Date.now() - startedAt,
+                        ai_key_used: keyInfo.key,
+                        retry_count: attempt,
+                        message: "Duplicate WAIT skipped",
+                        meta: {
+                            waitType: aiResponse.executionPlan.waitType,
+                            liquidityInteraction: aiResponse.lowerTimeframe.liquidityInteraction,
+                        },
+                    });
                     return;
                 }
 
                 // WAIT можно отправлять только текстом, а TRADE_NOW — с картинкой
+                const telegramStartedAt = Date.now();
                 if (aiResponse.executionPlan.status === "TRADE_NOW") {
                     await this.tgBot.telegram.sendPhoto(
                         CONFIG.tgChatId,
@@ -846,11 +985,39 @@ class QuantBot {
                     );
                 }
 
+                logEvent({
+                    symbol,
+                    phase: "telegram_send",
+                    status: "success",
+                    duration_ms: Date.now() - telegramStartedAt,
+                    screenshot_path: aiResponse.executionPlan.status === "TRADE_NOW" ? paths.pathEntry : undefined,
+                    ai_key_used: keyInfo.key,
+                    retry_count: attempt,
+                    meta: { status: aiResponse.executionPlan.status },
+                });
+                logEvent({
+                    symbol,
+                    phase: "analyze_and_send",
+                    status: "success",
+                    duration_ms: Date.now() - startedAt,
+                    screenshot_path: `${paths.pathEntry},${paths.pathContext}`,
+                    ai_key_used: keyInfo.key,
+                    retry_count: attempt,
+                });
                 console.log(chalk.green(`✅ Сигнал по ${symbol} отправлен в Telegram!`));
                 return; // Success, exit function
             } catch (error: any) {
                 if (this.isQuotaError(error)) {
                     console.error(chalk.red(`⚠️ [${symbol}] Лимит ключа ${keyInfo.key} исчерпан (429).`));
+                    logEvent({
+                        symbol,
+                        phase: "ai_generate_content",
+                        status: "failure",
+                        duration_ms: Date.now() - startedAt,
+                        ai_key_used: keyInfo.key,
+                        retry_count: attempt,
+                        error: error?.message || String(error),
+                    });
                     this.markKeyAsExceeded(keyInfo.key);
 
                     console.log(chalk.cyan(`🔄 [${symbol}] Пробую переключиться на другой ключ...`));
@@ -862,13 +1029,42 @@ class QuantBot {
                     const delayMs = retryDelays[attempt];
                     const delayMin = delayMs / 60000;
                     console.log(chalk.yellow(`⚠️ [${symbol}] Модель перегружена (503). Попытка ${attempt + 1}/${retryDelays.length}. Повтор через ${delayMin} мин...`));
+                    logEvent({
+                        symbol,
+                        phase: "ai_generate_content",
+                        status: "retry",
+                        duration_ms: Date.now() - startedAt,
+                        ai_key_used: keyInfo.key,
+                        retry_count: attempt + 1,
+                        error: error?.message || String(error),
+                        meta: { retryDelayMs: delayMs },
+                    });
                     await this.sleep(delayMs);
                 } else if (this.isRetryableError(error)) {
                     console.error(chalk.red(`❌ [${symbol}] Все ${retryDelays.length} попытки (503) исчерпаны. Пропускаем до следующего запуска.`));
+                    logEvent({
+                        symbol,
+                        phase: "ai_generate_content",
+                        status: "failure",
+                        duration_ms: Date.now() - startedAt,
+                        ai_key_used: keyInfo.key,
+                        retry_count: attempt,
+                        error: error?.message || String(error),
+                    });
                     return;
                 } else {
                     // Non-retryable error (including JSON validation failures after all retries)
                     console.error(chalk.red(`❌ Ошибка анализа ${symbol}:`), error.message);
+                    logEvent({
+                        symbol,
+                        phase: "analyze_and_send",
+                        status: "failure",
+                        duration_ms: Date.now() - startedAt,
+                        screenshot_path: `${paths.pathEntry},${paths.pathContext}`,
+                        ai_key_used: keyInfo.key,
+                        retry_count: attempt,
+                        error: error?.message || String(error),
+                    });
                     return;
                 }
             }
@@ -980,10 +1176,26 @@ class QuantBot {
 
                     // Кропаем перед анализом
                     console.log(chalk.yellow(`[${symbolConfig.symbol}] Подготовка скриншотов (кроп)...`));
+                    const cropStartedAt = Date.now();
                     try {
                         await this.imageProcessor.cropImages([paths.pathEntry, paths.pathContext]);
+                        logEvent({
+                            symbol: symbolConfig.symbol,
+                            phase: "crop_images",
+                            status: "success",
+                            duration_ms: Date.now() - cropStartedAt,
+                            screenshot_path: `${paths.pathEntry},${paths.pathContext}`,
+                        });
                     } catch (cropErr: any) {
                         console.error(chalk.red(`❌ Ошибка кропа для ${symbolConfig.symbol}:`), cropErr.message);
+                        logEvent({
+                            symbol: symbolConfig.symbol,
+                            phase: "crop_images",
+                            status: "failure",
+                            duration_ms: Date.now() - cropStartedAt,
+                            screenshot_path: `${paths.pathEntry},${paths.pathContext}`,
+                            error: cropErr?.message || String(cropErr),
+                        });
                     }
 
                     await this.analyzeAndSend(symbolConfig.symbol, paths);
