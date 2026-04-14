@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Browser auth/cookies
+auth.json
+auth*.json
+
+# Runtime state
+keys_usage.json
+trade_state.json
+
+# Generated screenshots and exports
+screenshots/
+src-export.txt
+
+# Local drafts
+draft/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

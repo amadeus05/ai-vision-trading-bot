@@ -1,0 +1,27 @@
+{
+  "scripts": {
+    "dev": "tsx ./src/bot.ts",
+    "save-auth": "tsx ./scripts/save-auth.ts",
+    "build": "tsc",
+    "start": "node ./dist/src/bot.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.38.0",
+    "axios": "^1.13.4",
+    "chalk": "^5.6.2",
+    "dotenv": "^17.2.3",
+    "playwright": "^1.58.0",
+    "save-dev": "^0.0.1-security",
+    "sharp": "^0.34.5",
+    "telegraf": "^4.16.3",
+    "tsx": "^4.21.0",
+    "ws": "^8.19.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.1.0",
+    "@types/ws": "^8.18.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
