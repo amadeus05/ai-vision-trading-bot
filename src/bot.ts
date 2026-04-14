@@ -102,6 +102,7 @@ const CONFIG = {
 
 const STATE_FILE = "./trade_state.json";
 const KEYS_USAGE_FILE = "./keys_usage.json";
+const WAIT_NOTIFICATIONS_FILE = "./wait_notifications.json";
 
 // ===================== TYPES =====================
 interface KeyUsage {
@@ -112,12 +113,19 @@ interface KeyUsage {
     isExceeded?: boolean;
 }
 
+interface WaitNotificationState {
+    waitType: AiResponse["executionPlan"]["waitType"];
+    liquidityInteraction: AiResponse["lowerTimeframe"]["liquidityInteraction"];
+    activationTrigger: string;
+}
+
 // ===================== BOT =====================
 class QuantBot {
     private tgBot: Telegraf;
     private browser: Browser | null = null;
     private tradeState: any = { active: false, side: null };
     private keysUsage: KeyUsage[] = [];
+    private lastWaitNotifications: Record<string, WaitNotificationState> = {};
     private imageProcessor: ImageProcessor;
 
     constructor() {
@@ -137,6 +145,7 @@ class QuantBot {
         this.tgBot = new Telegraf(CONFIG.tgToken);
         this.loadState();
         this.loadKeysUsage();
+        this.loadWaitNotifications();
         this.checkAndResetKeys();
     }
 
@@ -164,6 +173,21 @@ class QuantBot {
 
     private saveKeysUsage() {
         fs.writeFileSync(KEYS_USAGE_FILE, JSON.stringify(this.keysUsage, null, 2));
+    }
+
+    private loadWaitNotifications() {
+        if (fs.existsSync(WAIT_NOTIFICATIONS_FILE)) {
+            try {
+                const data = JSON.parse(fs.readFileSync(WAIT_NOTIFICATIONS_FILE, "utf-8"));
+                this.lastWaitNotifications = data && typeof data === "object" && !Array.isArray(data) ? data : {};
+            } catch (e) {
+                this.lastWaitNotifications = {};
+            }
+        }
+    }
+
+    private saveWaitNotifications() {
+        fs.writeFileSync(WAIT_NOTIFICATIONS_FILE, JSON.stringify(this.lastWaitNotifications, null, 2));
     }
 
     private checkAndResetKeys() {
@@ -379,6 +403,7 @@ class QuantBot {
 
             const pathEntry = `./screenshots/${symbol.toLowerCase()}_${entryTf.toLowerCase()}.png`;
             if (!fs.existsSync("./screenshots")) fs.mkdirSync("./screenshots");
+            await this.removeChartPanes(page);
             await page.screenshot({ path: pathEntry, fullPage: false });
             console.log(chalk.green(`📸 Скриншот ${entryTf} успешно сделан!`));
 
@@ -390,6 +415,7 @@ class QuantBot {
                 await page.waitForTimeout(15000); // Ждем прогрузки
             }
             const pathContext = `./screenshots/${symbol.toLowerCase()}_${contextTf.toLowerCase()}.png`;
+            await this.removeChartPanes(page);
             await page.screenshot({ path: pathContext, fullPage: false });
             console.log(chalk.green(`📸 Скриншот ${contextTf} успешно сделан!`));
 
@@ -398,6 +424,24 @@ class QuantBot {
             await page.close();
             await context.close();
         }
+    }
+
+    private async removeChartPanes(page: Page): Promise<void> {
+        const removedCount = await page.evaluate(() => {
+            const panes = Array.from(document.querySelectorAll('[id="candle_pane"], [id^="indicator_pane__"]'));
+            const legendChart = document.querySelector("#legend_chart_1");
+            const legendChartSiblings = legendChart?.parentElement
+                ? Array.from(legendChart.parentElement.children).filter((element) => element !== legendChart)
+                : [];
+
+            panes.push(...legendChartSiblings);
+
+            const uniquePanes = Array.from(new Set(panes));
+            uniquePanes.forEach((pane) => pane.remove());
+            return uniquePanes.length;
+        });
+
+        console.log(chalk.gray(`   -> Removed chart DOM panes: ${removedCount}`));
     }
 
     /**
@@ -593,6 +637,129 @@ class QuantBot {
             (error?.error && error.error.status === 'RESOURCE_EXHAUSTED');
     }
 
+    private enforceTradeRules(aiResponse: AiResponse): AiResponse {
+        const isLong = aiResponse.lowerTimeframe.side === "LONG";
+        const isShort = aiResponse.lowerTimeframe.side === "SHORT";
+
+        const hasStrongRelevantZone =
+            (isLong && aiResponse.higherTimeframe.nearestBrightLiquidityBelowStrength === "STRONG") ||
+            (isShort && aiResponse.higherTimeframe.nearestBrightLiquidityAboveStrength === "STRONG");
+
+        const tradeAllowedByRules =
+            aiResponse.executionPlan.status === "TRADE_NOW" &&
+            aiResponse.lowerTimeframe.canTradeNow &&
+            aiResponse.lowerTimeframe.side !== "WAIT" &&
+            aiResponse.lowerTimeframe.tradeTriggerType !== "NO_TRIGGER" &&
+            aiResponse.lowerTimeframe.liquidityInteraction !== "BETWEEN_ZONES" &&
+            aiResponse.lowerTimeframe.liquidityInteraction !== "NONE" &&
+            aiResponse.lowerTimeframe.entryPrice !== null &&
+            aiResponse.lowerTimeframe.stopLoss !== null &&
+            aiResponse.lowerTimeframe.takeProfit1 !== null &&
+            aiResponse.lowerTimeframe.rr !== null &&
+            aiResponse.lowerTimeframe.rr >= 2.5 &&
+            hasStrongRelevantZone;
+
+        const isChasingLong =
+            aiResponse.lowerTimeframe.side === "LONG" &&
+            aiResponse.higherTimeframe.trendQuality === "OVEREXTENDED" &&
+            aiResponse.lowerTimeframe.priceLocation === "EXTENDED_FROM_ZONE";
+
+        const isChasingShort =
+            aiResponse.lowerTimeframe.side === "SHORT" &&
+            aiResponse.higherTimeframe.trendQuality === "OVEREXTENDED" &&
+            aiResponse.lowerTimeframe.priceLocation === "EXTENDED_FROM_ZONE";
+
+        if (tradeAllowedByRules && !isChasingLong && !isChasingShort) {
+            aiResponse.executionPlan.waitType = null;
+            return aiResponse;
+        }
+
+        aiResponse.lowerTimeframe.side = "WAIT";
+        aiResponse.lowerTimeframe.canTradeNow = false;
+        aiResponse.lowerTimeframe.entryPrice = null;
+        aiResponse.lowerTimeframe.stopLoss = null;
+        aiResponse.lowerTimeframe.takeProfit1 = null;
+        aiResponse.lowerTimeframe.takeProfit2 = null;
+        aiResponse.lowerTimeframe.rr = null;
+        aiResponse.lowerTimeframe.tradeTriggerType = "NO_TRIGGER";
+        aiResponse.executionPlan.status = "WAIT";
+
+        if (!aiResponse.executionPlan.waitType) {
+            if (aiResponse.lowerTimeframe.priceLocation === "EXTENDED_FROM_ZONE") {
+                aiResponse.executionPlan.waitType = "WAIT_OVEREXTENDED";
+            } else if (
+                aiResponse.lowerTimeframe.liquidityInteraction === "BETWEEN_ZONES" ||
+                aiResponse.lowerTimeframe.liquidityInteraction === "NONE"
+            ) {
+                aiResponse.executionPlan.waitType = "WAIT_NO_NEAR_RISK_POINT";
+            } else {
+                aiResponse.executionPlan.waitType = "WAIT_NO_NEAR_RISK_POINT";
+            }
+        }
+
+        return aiResponse;
+    }
+
+    private normalizeActivationTrigger(value: string): string {
+        return value
+            .toLowerCase()
+            .replace(/[^\p{L}\p{N}\s]/gu, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+
+    private areActivationTriggersSimilar(current: string, previous: string): boolean {
+        const normalizedCurrent = this.normalizeActivationTrigger(current);
+        const normalizedPrevious = this.normalizeActivationTrigger(previous);
+
+        if (!normalizedCurrent || !normalizedPrevious) {
+            return normalizedCurrent === normalizedPrevious;
+        }
+
+        if (
+            normalizedCurrent === normalizedPrevious ||
+            normalizedCurrent.includes(normalizedPrevious) ||
+            normalizedPrevious.includes(normalizedCurrent)
+        ) {
+            return true;
+        }
+
+        const currentWords = new Set(normalizedCurrent.split(" "));
+        const previousWords = new Set(normalizedPrevious.split(" "));
+        const intersectionSize = [...currentWords].filter(word => previousWords.has(word)).length;
+        const unionSize = new Set([...currentWords, ...previousWords]).size;
+
+        return unionSize > 0 && intersectionSize / unionSize >= 0.8;
+    }
+
+    private shouldSkipDuplicateWait(symbol: string, aiResponse: AiResponse): boolean {
+        if (aiResponse.executionPlan.status !== "WAIT") {
+            delete this.lastWaitNotifications[symbol];
+            this.saveWaitNotifications();
+            return false;
+        }
+
+        const previous = this.lastWaitNotifications[symbol];
+        const current: WaitNotificationState = {
+            waitType: aiResponse.executionPlan.waitType,
+            liquidityInteraction: aiResponse.lowerTimeframe.liquidityInteraction,
+            activationTrigger: aiResponse.executionPlan.activationTrigger,
+        };
+
+        const isDuplicate =
+            previous !== undefined &&
+            previous.waitType === current.waitType &&
+            previous.liquidityInteraction === current.liquidityInteraction &&
+            this.areActivationTriggersSimilar(current.activationTrigger, previous.activationTrigger);
+
+        if (!isDuplicate) {
+            this.lastWaitNotifications[symbol] = current;
+            this.saveWaitNotifications();
+        }
+
+        return isDuplicate;
+    }
+
     async analyzeAndSend(symbol: string, paths: { pathEntry: string, pathContext: string }) {
         console.log(chalk.yellow(`[${symbol}] Отправка в AI для анализа...`));
 
@@ -607,8 +774,8 @@ class QuantBot {
         const base64ImageContext = fs.readFileSync(paths.pathContext, { encoding: "base64" });
 
         const contextText = this.tradeState.active
-            ? `ВНИМАНИЕ: У нас открыта позиция ${this.tradeState.side}. Проанализируй график: нужно ли продолжать держать (HOLD) или пора закрывать (CLOSE)?`
-            : `Сейчас открытых позиций нет. Проанализируй график и найди точку входа.`;
+            ? `У нас уже есть открытая позиция ${this.tradeState.side}. Оцени, есть ли новый валидный trigger прямо сейчас, или корректный ответ — WAIT. Не используй HOLD/CLOSE.`
+            : `Открытых позиций нет. Оцени, есть ли валидный торговый trigger прямо сейчас. Если trigger не завершен, верни WAIT с конкретным activationTrigger.`;
 
         const requestContents = [
             { text: getSystemPrompt(CONFIG.timeframes.entryTf, CONFIG.timeframes.contextTf) },
@@ -634,31 +801,50 @@ class QuantBot {
         for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
             try {
                 // getValidAiResponse handles JSON validation retries internally
-                const aiResponse = await this.getValidAiResponse(ai, requestContents, symbol, 2);
+                let aiResponse = await this.getValidAiResponse(ai, requestContents, symbol, 2);
+
+                // Применяем жесткий rule-engine поверх ответа модели
+                aiResponse = this.enforceTradeRules(aiResponse);
 
                 this.incrementKeyUsage(symbol);
                 this.saveStateFromAiResponse(aiResponse);
 
                 // Format response for Telegram
-                const formattedMessage = formatAiResponseForTelegram(aiResponse, symbol);
-
-                // Telegram photo captions are limited to 1024 chars
-                // Send photo with short header, then full analysis as separate message
-                await this.tgBot.telegram.sendPhoto(
-                    CONFIG.tgChatId,
-                    Input.fromLocalFile(paths.pathEntry),
-                    {
-                        caption: `🚀 <b>${symbol} ${CONFIG.timeframes.entryTf}/${CONFIG.timeframes.contextTf} UPDATE</b>`,
-                        parse_mode: "HTML"
-                    }
+                const formattedMessage = formatAiResponseForTelegram(
+                    aiResponse,
+                    symbol,
+                    CONFIG.timeframes.entryTf,
+                    CONFIG.timeframes.contextTf
                 );
 
-                // Send formatted analysis as separate message
-                await this.tgBot.telegram.sendMessage(
-                    CONFIG.tgChatId,
-                    formattedMessage,
-                    { parse_mode: "HTML" }
-                );
+                if (this.shouldSkipDuplicateWait(symbol, aiResponse)) {
+                    console.log(chalk.gray(`[${symbol}] Duplicate WAIT skipped: ${aiResponse.executionPlan.waitType}`));
+                    return;
+                }
+
+                // WAIT можно отправлять только текстом, а TRADE_NOW — с картинкой
+                if (aiResponse.executionPlan.status === "TRADE_NOW") {
+                    await this.tgBot.telegram.sendPhoto(
+                        CONFIG.tgChatId,
+                        Input.fromLocalFile(paths.pathEntry),
+                        {
+                            caption: `🚀 <b>${symbol} ${CONFIG.timeframes.entryTf}/${CONFIG.timeframes.contextTf} TRADE NOW</b>`,
+                            parse_mode: "HTML"
+                        }
+                    );
+
+                    await this.tgBot.telegram.sendMessage(
+                        CONFIG.tgChatId,
+                        formattedMessage,
+                        { parse_mode: "HTML" }
+                    );
+                } else {
+                    await this.tgBot.telegram.sendMessage(
+                        CONFIG.tgChatId,
+                        formattedMessage,
+                        { parse_mode: "HTML" }
+                    );
+                }
 
                 console.log(chalk.green(`✅ Сигнал по ${symbol} отправлен в Telegram!`));
                 return; // Success, exit function
@@ -693,12 +879,25 @@ class QuantBot {
      * Сохраняет состояние на основе структурированного AI ответа
      */
     private saveStateFromAiResponse(response: AiResponse) {
-        if (response.signal === "LONG") {
-            this.tradeState = { active: true, side: "LONG" };
-        } else if (response.signal === "SHORT") {
-            this.tradeState = { active: true, side: "SHORT" };
+        if (
+            response.executionPlan.status === "TRADE_NOW" &&
+            response.lowerTimeframe.canTradeNow &&
+            (response.lowerTimeframe.side === "LONG" || response.lowerTimeframe.side === "SHORT")
+        ) {
+            this.tradeState = {
+                active: true,
+                side: response.lowerTimeframe.side,
+                entry: response.lowerTimeframe.entryPrice,
+                stopLoss: response.lowerTimeframe.stopLoss,
+                takeProfit1: response.lowerTimeframe.takeProfit1,
+                takeProfit2: response.lowerTimeframe.takeProfit2,
+                triggerType: response.lowerTimeframe.tradeTriggerType,
+                interaction: response.lowerTimeframe.liquidityInteraction,
+            };
+        } else {
+            this.tradeState = { active: false, side: null };
         }
-        // WAIT не меняет состояние - сохраняем текущее
+
         fs.writeFileSync(STATE_FILE, JSON.stringify(this.tradeState, null, 2));
     }
 
